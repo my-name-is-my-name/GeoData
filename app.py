@@ -76,6 +76,22 @@ def get_transform(img_size=512):
     ])
 
 
+def get_transform_with_padding(img_size=512):
+    """Трансформации для инференса с паддингом"""
+    return A.Compose([
+        A.PadIfNeeded(
+            min_height=img_size,
+            min_width=img_size,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            position='top_left'
+        ),
+        A.CenterCrop(img_size, img_size),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+
 def create_overlay(image, mask, alpha=0.6):
     """Создаёт наложение маски на изображение"""
     if len(image.shape) == 2:
@@ -224,19 +240,57 @@ def smart_predict(model, image, device, patch_size=512):
         overlap = patch_size // 4  # 25% перекрытие
         return predict_sliding_window(model, image, device, patch_size, overlap)
     else:
-        # Для маленьких изображений - простой ресайз
-        st.info(f"⚡ Маленькое изображение ({w}×{h}): прямой анализ")
-        transform = get_transform(patch_size)
-        transformed = transform(image=image)
-        input_tensor = transformed['image'].unsqueeze(0).to(device)
+        # Для маленьких изображений - прямой анализ с паддингом
+        st.info(f"⚡ Маленькое изображение ({w}×{h}): прямой анализ с паддингом")
 
-        with torch.no_grad():
-            output = model(input_tensor)
-            prediction = torch.sigmoid(output).squeeze().cpu().numpy()
+        # Добавляем паддинг до размера patch_size, но сохраняем пропорции
+        # Если изображение уже больше patch_size по одной из сторон, используем ресайз
 
-        # Возвращаем к оригинальному размеру
-        prediction = cv2.resize(prediction, (w, h))
-        return prediction
+        # Определяем нужный размер для модели (patch_size)
+        target_size = patch_size
+
+        # Если изображение меньше target_size по любой из сторон, используем паддинг
+        if h < target_size or w < target_size:
+            # Создаём изображение с паддингом
+            padded_image = np.zeros((target_size, target_size, 3), dtype=image.dtype)
+
+            # Вычисляем координаты для размещения оригинала в центре
+            y_offset = (target_size - h) // 2
+            x_offset = (target_size - w) // 2
+
+            # Размещаем оригинальное изображение в центре
+            padded_image[y_offset:y_offset + h, x_offset:x_offset + w] = image
+
+            # Используем трансформацию без дополнительного ресайза
+            transform = A.Compose([
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+
+            transformed = transform(image=padded_image)
+            input_tensor = transformed['image'].unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                output = model(input_tensor)
+                prediction = torch.sigmoid(output).squeeze().cpu().numpy()
+
+            # Обрезаем паддинг, чтобы вернуться к оригинальному размеру
+            prediction = prediction[y_offset:y_offset + h, x_offset:x_offset + w]
+
+            return prediction
+        else:
+            # Изображение достаточно большое, используем ресайз до patch_size
+            transform = get_transform(patch_size)
+            transformed = transform(image=image)
+            input_tensor = transformed['image'].unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                output = model(input_tensor)
+                prediction = torch.sigmoid(output).squeeze().cpu().numpy()
+
+            # Возвращаем к оригинальному размеру
+            prediction = cv2.resize(prediction, (w, h))
+            return prediction
 
 
 def count_buildings_opencv(binary_mask, min_area=25):
@@ -296,6 +350,7 @@ def main():
             - Оптимальное разрешение: 0.3 м/пиксель
             - IoU: ~66%
             - Обработка: sliding window для больших изображений
+            - Паддинг: для маленьких изображений
             """)
 
     # ========== ЗАГРУЗКА МОДЕЛИ ==========
@@ -623,7 +678,7 @@ def main():
 - Чувствительность: {sensitivity}/10
 - Порог: {threshold:.2f}
 - Модель: U-Net Bilinear
-- Обработка: {'Sliding window' if h > 1024 or w > 1024 else 'Прямой анализ'}
+- Обработка: {'Sliding window' if h > 1024 or w > 1024 else 'Прямой анализ с паддингом'}
 """
 
                             st.download_button(
@@ -661,8 +716,8 @@ def main():
             ### Особенности:
             - Оптимально для снимков из Inria Aerial Dataset (0.3 м/пикс)
             - Для других снимков точность может быть ниже
-            - Для больших изображений используется **Sliding window** - снимок разрезается на патчи 512x512 пикселей, для патчей строятся предсказания, затем восстанавливается оригинальный размер
-            - Для маленьких изображений используется паддинг
+            - Для больших изображений используется **Sliding window** - снимок разрезается на патчи 512x512 пикселей
+            - Для маленьких изображений используется **паддинг** до 512x512 с сохранением оригинального изображения в центре
 
             ### Форматы:
             - PNG, JPG, JPEG (обычные изображения)
