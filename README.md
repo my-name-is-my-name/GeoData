@@ -9,7 +9,6 @@
 ## Структура репозитория
 
 ```
-satellite-building-segmentation/
 ├── models/                     # Архитектуры моделей
 │   ├── unet.py                 # U-Net для сегментации
 ├── utils/                      # Утилиты
@@ -30,8 +29,8 @@ satellite-building-segmentation/
 ### Клонирование репозитория
 
 ```bash
-git clone <repository-url>
-cd satellite-building-segmentation
+git clone https://github.com/my-name-is-my-name/GeoData.git
+cd GeoData
 ```
 
 ### Установка зависимостей
