@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 
 def test_model(model, test_loader, device, threshold=0.5, save_dir='./test_results'):
     """
-    Тестирование модели на тестовой выборке
+    Тестирование модели на тестовой выборкеcSxu!wNBnJ4Bjtd
     
     Args:
         model: обученная модель
