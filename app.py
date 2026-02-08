@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 import tempfile
 import math
+import datetime
 
 # Конфигурация
 st.set_page_config(
@@ -76,22 +77,6 @@ def get_transform(img_size=512):
     ])
 
 
-def get_transform_with_padding(img_size=512):
-    """Трансформации для инференса с паддингом"""
-    return A.Compose([
-        A.PadIfNeeded(
-            min_height=img_size,
-            min_width=img_size,
-            border_mode=cv2.BORDER_CONSTANT,
-            value=0,
-            position='top_left'
-        ),
-        A.CenterCrop(img_size, img_size),
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ToTensorV2(),
-    ])
-
-
 def create_overlay(image, mask, alpha=0.6):
     """Создаёт наложение маски на изображение"""
     if len(image.shape) == 2:
@@ -135,9 +120,10 @@ def extract_geotiff_metadata(filepath):
     return None, "not_geotiff"
 
 
-def predict_sliding_window(model, image, device, patch_size=512, overlap=128):
+def safe_sliding_window_predict(model, image, device, patch_size=512, overlap=128):
     """
-    Sliding window предсказание для больших изображений
+    Безопасный sliding window предсказание для больших изображений
+    без ошибок в прогресс-баре
     """
     h, w = image.shape[:2]
 
@@ -148,84 +134,123 @@ def predict_sliding_window(model, image, device, patch_size=512, overlap=128):
     # Шаг с учётом перекрытия
     stride = patch_size - overlap
 
-    # Считаем количество патчей
-    num_patches_h = math.ceil((h - overlap) / stride)
-    num_patches_w = math.ceil((w - overlap) / stride)
-    total_patches = num_patches_h * num_patches_w
-
-    if total_patches == 0:
-        return full_prediction
-
-    # Прогресс-бар
-    progress_bar = st.progress(0, text=f"Обработка 0/{total_patches} патчей")
-
-    # Создаём весовую маску для blending
-    y_coords, x_coords = np.meshgrid(
-        np.arange(patch_size),
-        np.arange(patch_size),
-        indexing='ij'
-    )
-    center = patch_size // 2
-    distances = np.sqrt((y_coords - center) ** 2 + (x_coords - center) ** 2)
-    patch_weights = np.clip(1 - distances / (patch_size / 2), 0, 1)
-
-    transform = get_transform(patch_size)
-    patch_counter = 0
-
-    # Обрабатываем все патчи
+    # Считаем реальное количество патчей, которые будем обрабатывать
+    patches_to_process = []
     for y in range(0, h, stride):
         for x in range(0, w, stride):
-            # Определяем границы патча
             y_end = min(y + patch_size, h)
             x_end = min(x + patch_size, w)
             patch_h = y_end - y
             patch_w = x_end - x
 
             # Пропускаем слишком маленькие патчи
-            if patch_h < 64 or patch_w < 64:
-                continue
+            if patch_h >= 64 and patch_w >= 64:
+                patches_to_process.append((y, x, y_end, x_end, patch_h, patch_w))
 
-            # Вырезаем патч
-            patch = image[y:y_end, x:x_end]
+    total_patches = len(patches_to_process)
 
-            # Если патч меньше нужного размера - добавляем паддинг
-            if patch_h < patch_size or patch_w < patch_size:
-                padded_patch = np.zeros((patch_size, patch_size, 3), dtype=patch.dtype)
-                padded_patch[:patch_h, :patch_w] = patch
-            else:
-                padded_patch = patch
+    if total_patches == 0:
+        return full_prediction
 
-            # Трансформации и предсказание
-            transformed = transform(image=padded_patch)
-            input_tensor = transformed['image'].unsqueeze(0).to(device)
+    # Статус-текст вместо прогресс-бара (более надежно)
+    status_text = st.empty()
+    status_text.text(f"Обработка 0/{total_patches} патчей...")
 
-            with torch.no_grad():
-                output = model(input_tensor)
-                prediction = torch.sigmoid(output).squeeze().cpu().numpy()
+    # Создаём весовую маску для blending
+    patch_weights_grid = np.zeros((patch_size, patch_size), dtype=np.float32)
+    for i in range(patch_size):
+        for j in range(patch_size):
+            dist = math.sqrt((i - patch_size // 2) ** 2 + (j - patch_size // 2) ** 2)
+            patch_weights_grid[i, j] = max(0, 1 - dist / (patch_size / 2))
 
-            # Обрезаем предсказание до реального размера патча
-            patch_pred = prediction[:patch_h, :patch_w]
-            patch_weights_cropped = patch_weights[:patch_h, :patch_w]
+    transform = get_transform(patch_size)
 
-            # Добавляем к полной маске с весами
-            full_prediction[y:y_end, x:x_end] += patch_pred * patch_weights_cropped
-            weight_map[y:y_end, x:x_end] += patch_weights_cropped
+    # Обрабатываем все патчи
+    for patch_idx, (y, x, y_end, x_end, patch_h, patch_w) in enumerate(patches_to_process):
+        # Обновляем статус каждые 10 патчей для производительности
+        if patch_idx % 10 == 0:
+            status_text.text(f"Обработка {patch_idx}/{total_patches} патчей...")
 
-            # Обновляем прогресс
-            patch_counter += 1
-            progress = patch_counter / total_patches
-            progress_bar.progress(
-                progress,
-                text=f"Обработка {patch_counter}/{total_patches} патчей ({progress:.1%})"
-            )
+        # Вырезаем патч
+        patch = image[y:y_end, x:x_end]
 
-    progress_bar.empty()
+        # Если патч меньше нужного размера - добавляем паддинг
+        if patch_h < patch_size or patch_w < patch_size:
+            padded_patch = np.zeros((patch_size, patch_size, 3), dtype=patch.dtype)
+            padded_patch[:patch_h, :patch_w] = patch
+        else:
+            padded_patch = patch
+
+        # Трансформации и предсказание
+        transformed = transform(image=padded_patch)
+        input_tensor = transformed['image'].unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            output = model(input_tensor)
+            prediction = torch.sigmoid(output).squeeze().cpu().numpy()
+
+        # Обрезаем предсказание до реального размера патча
+        patch_pred = prediction[:patch_h, :patch_w]
+        patch_weights = patch_weights_grid[:patch_h, :patch_w]
+
+        # Добавляем к полной маске с весами
+        full_prediction[y:y_end, x:x_end] += patch_pred * patch_weights
+        weight_map[y:y_end, x:x_end] += patch_weights
+
+    # Очищаем статус
+    status_text.empty()
 
     # Нормализуем результат
-    weight_map[weight_map == 0] = 1  # избегаем деления на 0
+    weight_map = np.where(weight_map == 0, 1, weight_map)  # избегаем деления на 0
     full_prediction = full_prediction / weight_map
 
     return full_prediction
+
+
+def predict_for_small_image(model, image, device, patch_size=512):
+    """
+    Предсказание для маленьких изображений с паддингом
+    """
+    h, w = image.shape[:2]
+
+    # Если изображение меньше patch_size, добавляем паддинг
+    if h < patch_size or w < patch_size:
+        # Создаём изображение с паддингом
+        padded_image = np.zeros((patch_size, patch_size, 3), dtype=image.dtype)
+
+        # Вычисляем координаты для размещения оригинала в центре
+        y_offset = (patch_size - h) // 2
+        x_offset = (patch_size - w) // 2
+
+        # Размещаем оригинальное изображение в центре
+        padded_image[y_offset:y_offset + h, x_offset:x_offset + w] = image
+
+        # Используем трансформацию
+        transform = get_transform(patch_size)
+        transformed = transform(image=padded_image)
+        input_tensor = transformed['image'].unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            output = model(input_tensor)
+            prediction = torch.sigmoid(output).squeeze().cpu().numpy()
+
+        # Обрезаем паддинг, чтобы вернуться к оригинальному размеру
+        prediction = prediction[y_offset:y_offset + h, x_offset:x_offset + w]
+
+        return prediction
+    else:
+        # Изображение достаточно большое, используем ресайз до patch_size
+        transform = get_transform(patch_size)
+        transformed = transform(image=image)
+        input_tensor = transformed['image'].unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            output = model(input_tensor)
+            prediction = torch.sigmoid(output).squeeze().cpu().numpy()
+
+        # Возвращаем к оригинальному размеру
+        prediction = cv2.resize(prediction, (w, h), interpolation=cv2.INTER_LINEAR)
+        return prediction
 
 
 def smart_predict(model, image, device, patch_size=512):
@@ -238,59 +263,11 @@ def smart_predict(model, image, device, patch_size=512):
     if h > 1024 or w > 1024:
         st.info(f"🔄 Большое изображение ({w}×{h}): использую sliding window")
         overlap = patch_size // 4  # 25% перекрытие
-        return predict_sliding_window(model, image, device, patch_size, overlap)
+        return safe_sliding_window_predict(model, image, device, patch_size, overlap)
     else:
         # Для маленьких изображений - прямой анализ с паддингом
-        st.info(f"⚡ Маленькое изображение ({w}×{h}): прямой анализ с паддингом")
-
-        # Добавляем паддинг до размера patch_size, но сохраняем пропорции
-        # Если изображение уже больше patch_size по одной из сторон, используем ресайз
-
-        # Определяем нужный размер для модели (patch_size)
-        target_size = patch_size
-
-        # Если изображение меньше target_size по любой из сторон, используем паддинг
-        if h < target_size or w < target_size:
-            # Создаём изображение с паддингом
-            padded_image = np.zeros((target_size, target_size, 3), dtype=image.dtype)
-
-            # Вычисляем координаты для размещения оригинала в центре
-            y_offset = (target_size - h) // 2
-            x_offset = (target_size - w) // 2
-
-            # Размещаем оригинальное изображение в центре
-            padded_image[y_offset:y_offset + h, x_offset:x_offset + w] = image
-
-            # Используем трансформацию без дополнительного ресайза
-            transform = A.Compose([
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ToTensorV2(),
-            ])
-
-            transformed = transform(image=padded_image)
-            input_tensor = transformed['image'].unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                output = model(input_tensor)
-                prediction = torch.sigmoid(output).squeeze().cpu().numpy()
-
-            # Обрезаем паддинг, чтобы вернуться к оригинальному размеру
-            prediction = prediction[y_offset:y_offset + h, x_offset:x_offset + w]
-
-            return prediction
-        else:
-            # Изображение достаточно большое, используем ресайз до patch_size
-            transform = get_transform(patch_size)
-            transformed = transform(image=image)
-            input_tensor = transformed['image'].unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                output = model(input_tensor)
-                prediction = torch.sigmoid(output).squeeze().cpu().numpy()
-
-            # Возвращаем к оригинальному размеру
-            prediction = cv2.resize(prediction, (w, h))
-            return prediction
+        st.info(f"⚡ Маленькое изображение ({w}×{h}): прямой анализ")
+        return predict_for_small_image(model, image, device, patch_size)
 
 
 def count_buildings_opencv(binary_mask, min_area=25):
@@ -318,6 +295,53 @@ def count_buildings_opencv(binary_mask, min_area=25):
     return len(valid_contours), building_areas_px
 
 
+def process_image_analysis(model, image_np, threshold, pixel_size, scale_source, sensitivity):
+    """
+    Основная функция обработки изображения
+    """
+    h, w = image_np.shape[:2]
+
+    # Предсказание
+    with st.spinner("Выполняется сегментация..."):
+        prediction = smart_predict(model, image_np, 'cpu', patch_size=512)
+
+    # Бинаризация
+    binary_mask = (prediction > threshold).astype(np.uint8)
+
+    # Визуализация
+    overlay = create_overlay(image_np, binary_mask, alpha=0.6)
+
+    # Расчёт основной площади
+    building_pixels = np.sum(binary_mask)
+    area_m2 = building_pixels * (pixel_size ** 2)
+    coverage = (building_pixels / binary_mask.size) * 100 if binary_mask.size > 0 else 0
+
+    # Статистика по объектам
+    num_buildings, building_areas_px = count_buildings_opencv(binary_mask, min_area=25)
+
+    # Конвертируем площади в м²
+    building_areas_m2 = [area * (pixel_size ** 2) for area in building_areas_px]
+
+    # Подготовка данных для отчета
+    analysis_data = {
+        'image_size': (w, h),
+        'pixel_size': pixel_size,
+        'scale_source': scale_source,
+        'threshold': threshold,
+        'sensitivity': sensitivity,
+        'binary_mask': binary_mask,
+        'overlay': overlay,
+        'building_pixels': building_pixels,
+        'area_m2': area_m2,
+        'coverage': coverage,
+        'num_buildings': num_buildings,
+        'building_areas_m2': building_areas_m2,
+        'prediction': prediction
+    }
+
+    return analysis_data
+
+
 # ==================== ОСНОВНОЙ ИНТЕРФЕЙС ====================
 
 def main():
@@ -342,7 +366,7 @@ def main():
         )
         threshold = sensitivity / 10
 
-        # Техническая информация (скрытая)
+        # Техническая информация
         with st.expander("ℹ️ Технические детали"):
             st.caption("""
             - Модель: U-Net Bilinear
@@ -362,10 +386,7 @@ def main():
 
         Путь: `{MODEL_PATH}`
 
-        Чтобы обучить модель:
-        ```bash
-        python train_seg.py --train_images_dir ./data/train/images ...
-        ```
+        Убедитесь, что файл модели находится в указанной папке.
         """)
         return
 
@@ -374,7 +395,7 @@ def main():
             model, model_info = load_trained_model(MODEL_PATH, 'cpu')
             if model:
                 st.session_state['model'] = model
-                st.success("✅ Модель загружена")
+                st.success(f"✅ Модель загружена (Эпоха: {model_info['epoch']}, IoU: {model_info['val_iou']:.3f})")
             else:
                 st.error("Не удалось загрузить модель")
                 return
@@ -383,9 +404,8 @@ def main():
     st.header("📤 Загрузите спутниковый снимок")
 
     uploaded_file = st.file_uploader(
-        " ",
+        "Выберите файл",
         type=['png', 'jpg', 'jpeg', 'tif', 'tiff'],
-        label_visibility="collapsed",
         help="Поддерживаемые форматы: PNG, JPG, TIFF, GeoTIFF"
     )
 
@@ -411,43 +431,44 @@ def main():
             # ========== ОПРЕДЕЛЕНИЕ МАСШТАБА ==========
             st.subheader("📏 Укажите масштаб снимка")
 
+            # Инициализация переменных в session_state если их нет
+            if 'selected_pixel_size' not in st.session_state:
+                st.session_state['selected_pixel_size'] = 0.3
+            if 'selected_scale_source' not in st.session_state:
+                st.session_state['selected_scale_source'] = "inria_default"
+
             pixel_size = None
             scale_source = ""
 
-            # Попытка 1: Из метаданных GeoTIFF
+            # Попытка из метаданных GeoTIFF
             if uploaded_file.name.lower().endswith(('.tif', '.tiff')):
-                with st.spinner("Проверка метаданных GeoTIFF..."):
-                    pixel_size, metadata_status = extract_geotiff_metadata(temp_path)
-
-                    if pixel_size:
-                        st.success(f"✅ Масштаб определён из метаданных: {pixel_size:.4f} м/пиксель")
-                        scale_source = "geotiff_metadata"
-                    else:
-                        st.info("ℹ️ Не удалось определить масштаб из метаданных")
+                pixel_size, scale_source = extract_geotiff_metadata(temp_path)
+                if pixel_size:
+                    st.success(f"✅ Масштаб определён из метаданных: {pixel_size:.4f} м/пиксель")
+                    st.session_state['selected_pixel_size'] = pixel_size
+                    st.session_state['selected_scale_source'] = scale_source
+                else:
+                    st.info("ℹ️ Не удалось определить масштаб из метаданных")
 
             # Если не определили из метаданных - предлагаем варианты
             if pixel_size is None:
-                tab1, tab2, tab3 = st.tabs([
-                    "📐 Метров на пиксель",
-                    "📏 Размеры участка",
-                    "ℹ️ Рекомендации"
-                ])
+                tab1, tab2, tab3 = st.tabs(["📐 Метров на пиксель", "📏 Размеры участка", "ℹ️ Рекомендации"])
 
                 with tab1:
                     st.markdown("**Укажите разрешение снимка:**")
 
-                    # Примеры типичных значений
+                    # Кнопки с типичными значениями
                     col_a, col_b, col_c = st.columns(3)
                     with col_a:
-                        if st.button("0.3 м", use_container_width=True, key="btn_03"):
+                        if st.button("0.3 м", use_container_width=True):
                             st.session_state['selected_pixel_size'] = 0.3
                             st.session_state['selected_scale_source'] = "inria_default"
                     with col_b:
-                        if st.button("0.5 м", use_container_width=True, key="btn_05"):
+                        if st.button("0.5 м", use_container_width=True):
                             st.session_state['selected_pixel_size'] = 0.5
                             st.session_state['selected_scale_source'] = "manual"
                     with col_c:
-                        if st.button("1.0 м", use_container_width=True, key="btn_10"):
+                        if st.button("1.0 м", use_container_width=True):
                             st.session_state['selected_pixel_size'] = 1.0
                             st.session_state['selected_scale_source'] = "manual"
 
@@ -456,7 +477,7 @@ def main():
                         "Или введите своё значение:",
                         min_value=0.01,
                         max_value=100.0,
-                        value=0.3,
+                        value=st.session_state['selected_pixel_size'],
                         step=0.01,
                         format="%.3f",
                         key="manual_input"
@@ -476,8 +497,7 @@ def main():
                             min_value=1.0,
                             max_value=100000.0,
                             value=100.0,
-                            step=1.0,
-                            key="width_input"
+                            step=1.0
                         )
                     with col_y:
                         height_m = st.number_input(
@@ -485,24 +505,22 @@ def main():
                             min_value=1.0,
                             max_value=100000.0,
                             value=100.0,
-                            step=1.0,
-                            key="height_input"
+                            step=1.0
                         )
 
-                    if width_m and height_m and w > 0 and h > 0:
+                    if width_m > 0 and height_m > 0:
                         pixel_size_x = width_m / w
                         pixel_size_y = height_m / h
                         pixel_size_avg = (pixel_size_x + pixel_size_y) / 2
 
                         st.info(f"Расчётный масштаб: {pixel_size_avg:.4f} м/пиксель")
 
-                        if st.button("Использовать расчётный масштаб", key="use_calc"):
+                        if st.button("Использовать расчётный масштаб"):
                             st.session_state['selected_pixel_size'] = pixel_size_avg
                             st.session_state['selected_scale_source'] = "calculated"
 
                 with tab3:
                     st.markdown("**Рекомендации по масштабу:**")
-
                     st.write("""
                     **Оптимально для этой модели:** 0.3 м/пиксель
 
@@ -515,67 +533,39 @@ def main():
                     **Inria Aerial Dataset:** 0.3 м/пиксель
                     """)
 
-                    if st.button("Использовать 0.3 м (Inria)", key="use_inria"):
+                    if st.button("Использовать 0.3 м (Inria)"):
                         st.session_state['selected_pixel_size'] = 0.3
                         st.session_state['selected_scale_source'] = "inria_default"
 
-            # ========== АНАЛИЗ ==========
-            # Всегда показываем кнопку анализа
+            # Показываем текущий выбранный масштаб
+            current_pixel_size = st.session_state['selected_pixel_size']
+            current_scale_source = st.session_state['selected_scale_source']
+
+            st.info(f"📏 Текущий масштаб: **{current_pixel_size:.4f} м/пиксель** ({current_scale_source})")
+
+            # Предупреждение если масштаб не 0.3
+            if abs(current_pixel_size - 0.3) > 0.05:
+                st.warning(f"""
+                ⚠️ **Внимание:** Вы указали масштаб {current_pixel_size:.3f} м/пиксель
+
+                Модель оптимизирована для **0.3 м/пиксель** (Inria Aerial Dataset).
+                Для этого разрешения точность может быть ниже.
+                """)
+
+            # ========== КНОПКА АНАЛИЗА ==========
             st.markdown("---")
 
-            # Проверяем, выбран ли масштаб (из метаданных или из session_state)
-            current_pixel_size = pixel_size
-            current_scale_source = scale_source
-
-            if current_pixel_size is None and 'selected_pixel_size' in st.session_state:
-                current_pixel_size = st.session_state['selected_pixel_size']
-                current_scale_source = st.session_state.get('selected_scale_source', 'manual')
-
-            # Показываем текущий выбранный масштаб
-            if current_pixel_size is not None:
-                st.info(f"📏 Выбранный масштаб: **{current_pixel_size:.4f} м/пиксель**")
-
-                # Предупреждение если масштаб не 0.3
-                if abs(current_pixel_size - 0.3) > 0.05:  # Если отличается более чем на 5%
-                    st.warning(f"""
-                    ⚠️ **Внимание:** Вы указали масштаб {current_pixel_size:.3f} м/пиксель
-
-                    Модель оптимизирована для **0.3 м/пиксель** (Inria Aerial Dataset).
-                    Для этого разрешения точность может быть ниже.
-                    """)
-
-            # Кнопка запуска анализа
             if st.button("🚀 Начать анализ", type="primary", use_container_width=True):
-
-                # Проверяем, что масштаб выбран
-                if current_pixel_size is None:
-                    st.error("❌ Сначала укажите масштаб снимка!")
-                    st.stop()
-
-                with st.spinner("Обработка изображения..."):
+                with st.spinner("Выполняется анализ..."):
                     try:
-                        # Предсказание с sliding window
+                        # Получаем модель
                         model = st.session_state['model']
 
-                        # Используем patch_size=512 как при обучении
-                        prediction = smart_predict(model, image_np, 'cpu', patch_size=512)
-
-                        # Бинаризация
-                        binary_mask = (prediction > threshold).astype(np.uint8)
-
-                        # Визуализация
-                        overlay = create_overlay(image_np, binary_mask, alpha=0.6)
-
-                        # Расчёт основной площади
-                        building_pixels = np.sum(binary_mask)
-                        area_m2 = building_pixels * (current_pixel_size ** 2)
-                        coverage = (building_pixels / binary_mask.size) * 100
-
-                        # Статистика по объектам
-                        num_buildings, building_areas_px = count_buildings_opencv(binary_mask, min_area=25)
-
-                        # Конвертируем площади в м²
-                        building_areas_m2 = [area * (current_pixel_size ** 2) for area in building_areas_px]
+                        # Обработка изображения
+                        analysis_data = process_image_analysis(
+                            model, image_np, threshold,
+                            current_pixel_size, current_scale_source, sensitivity
+                        )
 
                         # Показываем результаты
                         with col2:
@@ -585,45 +575,49 @@ def main():
                             tab_viz, tab_stats = st.tabs(["Визуализация", "Статистика"])
 
                             with tab_viz:
-                                st.image(overlay, use_container_width=True)
-                                st.caption(f"Найдено зданий: {num_buildings}")
+                                st.image(analysis_data['overlay'], use_container_width=True)
+                                st.caption(f"Найдено зданий: {analysis_data['num_buildings']}")
 
                             with tab_stats:
                                 # Основные метрики
                                 st.metric(
                                     "Площадь застройки",
-                                    f"{area_m2:,.0f} м²",
+                                    f"{analysis_data['area_m2']:,.0f} м²",
                                     delta=None,
                                     help=f"При {current_pixel_size:.3f} м/пиксель"
                                 )
 
                                 st.metric(
                                     "Процент застройки",
-                                    f"{coverage:.1f}%"
+                                    f"{analysis_data['coverage']:.1f}%"
                                 )
 
                                 st.metric(
                                     "Количество зданий",
-                                    f"{num_buildings}"
+                                    f"{analysis_data['num_buildings']}"
                                 )
 
                                 st.metric(
                                     "Пиксели зданий",
-                                    f"{building_pixels:,}"
+                                    f"{analysis_data['building_pixels']:,}"
                                 )
 
                                 # Дополнительная статистика если есть здания
-                                if num_buildings > 0:
+                                if analysis_data['num_buildings'] > 0:
                                     st.markdown("---")
                                     st.subheader("📊 Статистика по зданиям")
 
                                     col_stat1, col_stat2 = st.columns(2)
                                     with col_stat1:
-                                        st.write(f"**Средняя площадь:** {np.mean(building_areas_m2):.0f} м²")
-                                        st.write(f"**Медианная площадь:** {np.median(building_areas_m2):.0f} м²")
+                                        mean_area = np.mean(analysis_data['building_areas_m2'])
+                                        median_area = np.median(analysis_data['building_areas_m2'])
+                                        st.write(f"**Средняя площадь:** {mean_area:.0f} м²")
+                                        st.write(f"**Медианная площадь:** {median_area:.0f} м²")
                                     with col_stat2:
-                                        st.write(f"**Минимальная площадь:** {np.min(building_areas_m2):.0f} м²")
-                                        st.write(f"**Максимальная площадь:** {np.max(building_areas_m2):.0f} м²")
+                                        min_area = np.min(analysis_data['building_areas_m2'])
+                                        max_area = np.max(analysis_data['building_areas_m2'])
+                                        st.write(f"**Минимальная площадь:** {min_area:.0f} м²")
+                                        st.write(f"**Максимальная площадь:** {max_area:.0f} м²")
 
                                 # Информация о масштабе
                                 st.info(f"""
@@ -639,7 +633,7 @@ def main():
 
                         with col_dl1:
                             # Маска
-                            mask_pil = Image.fromarray((binary_mask * 255).astype(np.uint8))
+                            mask_pil = Image.fromarray((analysis_data['binary_mask'] * 255).astype(np.uint8))
                             mask_bytes = io.BytesIO()
                             mask_pil.save(mask_bytes, format='PNG')
 
@@ -652,10 +646,20 @@ def main():
 
                         with col_dl2:
                             # Отчёт
+                            report_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            mean_area = np.mean(analysis_data['building_areas_m2']) if analysis_data[
+                                                                                           'num_buildings'] > 0 else 0
+                            median_area = np.median(analysis_data['building_areas_m2']) if analysis_data[
+                                                                                               'num_buildings'] > 0 else 0
+                            min_area = np.min(analysis_data['building_areas_m2']) if analysis_data[
+                                                                                         'num_buildings'] > 0 else 0
+                            max_area = np.max(analysis_data['building_areas_m2']) if analysis_data[
+                                                                                         'num_buildings'] > 0 else 0
+
                             report = f"""АНАЛИЗ ПЛОЩАДИ ЗАСТРОЙКИ
 
 Файл: {uploaded_file.name}
-Дата: {st.session_state.get('analysis_time', 'N/A')}
+Дата анализа: {report_time}
 
 РАЗМЕРЫ:
 - Изображение: {w} × {h} пикселей
@@ -663,16 +667,16 @@ def main():
 - Общая площадь кадра: {(w * h * current_pixel_size ** 2):,.0f} м²
 
 РЕЗУЛЬТАТЫ:
-- Площадь застройки: {area_m2:,.0f} м²
-- Процент застройки: {coverage:.1f}%
-- Количество зданий: {num_buildings}
-- Пиксели зданий: {building_pixels:,}
+- Площадь застройки: {analysis_data['area_m2']:,.0f} м²
+- Процент застройки: {analysis_data['coverage']:.1f}%
+- Количество зданий: {analysis_data['num_buildings']}
+- Пиксели зданий: {analysis_data['building_pixels']:,}
 
 СТАТИСТИКА ПО ЗДАНИЯМ:
-- Средняя площадь: {np.mean(building_areas_m2) if num_buildings > 0 else 0:.0f} м²
-- Медианная площадь: {np.median(building_areas_m2) if num_buildings > 0 else 0:.0f} м²
-- Минимальная площадь: {np.min(building_areas_m2) if num_buildings > 0 else 0:.0f} м²
-- Максимальная площадь: {np.max(building_areas_m2) if num_buildings > 0 else 0:.0f} м²
+- Средняя площадь: {mean_area:.0f} м²
+- Медианная площадь: {median_area:.0f} м²
+- Минимальная площадь: {min_area:.0f} м²
+- Максимальная площадь: {max_area:.0f} м²
 
 ПАРАМЕТРЫ:
 - Чувствительность: {sensitivity}/10
@@ -690,6 +694,7 @@ def main():
 
                     except Exception as e:
                         st.error(f"❌ Ошибка обработки: {str(e)}")
+                        st.exception(e)  # Показываем полный traceback для отладки
 
         finally:
             # Удаляем временный файл
@@ -716,8 +721,8 @@ def main():
             ### Особенности:
             - Оптимально для снимков из Inria Aerial Dataset (0.3 м/пикс)
             - Для других снимков точность может быть ниже
-            - Для больших изображений используется **Sliding window** - снимок разрезается на патчи 512x512 пикселей
-            - Для маленьких изображений используется **паддинг** до 512x512 с сохранением оригинального изображения в центре
+            - Для больших изображений используется **Sliding window**
+            - Для маленьких изображений используется **паддинг**
 
             ### Форматы:
             - PNG, JPG, JPEG (обычные изображения)
@@ -726,14 +731,14 @@ def main():
 
 
 if __name__ == '__main__':
-    import datetime
+    # Инициализация переменных session_state
+    if 'analysis_time' not in st.session_state:
+        st.session_state['analysis_time'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    st.session_state['analysis_time'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Инициализируем session_state переменные если их нет
     if 'selected_pixel_size' not in st.session_state:
-        st.session_state['selected_pixel_size'] = None
+        st.session_state['selected_pixel_size'] = 0.3
+
     if 'selected_scale_source' not in st.session_state:
-        st.session_state['selected_scale_source'] = ""
+        st.session_state['selected_scale_source'] = "inria_default"
 
     main()
