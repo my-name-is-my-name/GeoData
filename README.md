@@ -25,6 +25,7 @@ https://colab.research.google.com/drive/1l_hgUgh9VuI1ZRwsVu0AP4_Tv5kXbpuH?usp=sh
 ├── train_seg.py                # Скрипт обучения сегментации
 ├── app.py                      # Streamlit приложение
 ├── requirements.txt            # Зависимости
+├── create_patches.py           # Обработка исходного датасета
 └── README.md                   # Документация
 ```
 
@@ -45,7 +46,15 @@ pip install -r requirements.txt
 
 ### Подготовка данных
 
-Скачайте датасет и разместите его в следующей структуре:
+Исходный датасет (содержит снимки 5000x5000 пикселей):
+https://project.inria.fr/aerialimagelabeling/download/
+
+Всего в данных 180 снимков, которые вручную разбил на train, val, test по 126, 27, 27 снимков соответственно
+
+Все изображения разбиты на патчи 512x512 пикселей при помощи файла create_patches.py из репозитория
+
+Скачайте датасет порезанных снимков https://drive.google.com/file/d/1rUP1UU9IDFyBftEXbPlp3cRkebFC6-3t/view?usp=sharing 
+Разместите его в следующей структуре:
 
 ```
 data/
