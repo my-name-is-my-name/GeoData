@@ -111,7 +111,7 @@ python test_model.py \
 ### Запуск веб-приложения
 
 
-Нужно загрузить веса обученной модели https://drive.google.com/drive/folders/1JS8vEyTWkVXDMCrwJzU34EYGoHTCHuvV?usp=sharing в папку weights. 
+Нужно загрузить веса обученной модели best_model.pth https://drive.google.com/drive/folders/1JS8vEyTWkVXDMCrwJzU34EYGoHTCHuvV?usp=sharing в папку weights. 
 По результатам обучения лучшая модель unet_bilinear (так как ее удалось обучить на бОльшем количестве эпох)
 app.py работает именно с моделью unet_bilinear, для того чтобы запустить приложение с другой обученной моделью нужно будет скорректировать код
 
